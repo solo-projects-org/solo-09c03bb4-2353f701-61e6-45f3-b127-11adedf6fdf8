@@ -1,0 +1,42 @@
+services:
+  oai-source:
+    build:
+      context: ./sample-oai
+    image: union-catalog/sample-oai:latest
+    environment:
+      # 每页 10 条，27 条样例记录分 3 页，便于观察 resumptionToken 翻页
+      PAGE_SIZE: "10"
+      PORT: "8080"
+      TOKEN_TTL: "3600"
+      BASE_URL: "http://oai-source:8080/oai"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  harvester-api:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    image: union-catalog/harvester-api:latest
+    depends_on:
+      oai-source:
+        condition: service_healthy
+    environment:
+      OAI_ENDPOINT: "http://oai-source:8080/oai"
+      APP_DB_PATH: "/data/harvester.db"
+    ports:
+      - "8000:8000"
+    volumes:
+      - harvester-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  harvester-data:
