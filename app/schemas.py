@@ -62,7 +62,9 @@ class RunOut(BaseModel):
     finished_at: str | None
     from_date: str
     until_date: str
-    status: str
+    status: str = Field(
+        ..., description="running / success / failed / revoked（已撤销）"
+    )
     pages: int
     fetched: int
     inserted: int
@@ -70,3 +72,21 @@ class RunOut(BaseModel):
     withdrawn: int
     retries: int
     error: str | None
+    snapshot_version: int | None = Field(
+        None, description="非空表示升级后带快照的批次，可在满足条件时撤销"
+    )
+    prev_last_until: str | None = Field(
+        None, description="该批采集前的续采进度（撤销后回退到此值）"
+    )
+    revoked_at: str | None = Field(None, description="撤销时间，未撤销为空")
+
+
+class RevokeResponse(BaseModel):
+    run_id: int = Field(..., description="被撤销的采集运行编号")
+    status: str = Field("revoked", description="固定为 revoked")
+    restored: int = Field(..., description="恢复到批前内容/状态的改写书目数")
+    deleted: int = Field(..., description="移除的本批新增书目数（含墓碑）")
+    prev_last_until: str | None = Field(
+        None, description="回退后的续采截止日；null 表示退回未采集状态"
+    )
+    revoked_at: str = Field(..., description="撤销完成时间（UTC）")

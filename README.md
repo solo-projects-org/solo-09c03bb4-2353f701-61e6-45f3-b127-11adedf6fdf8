@@ -15,6 +15,14 @@
 | 遇删除标记就撤下 | header `status=deleted` 的记录置为 `withdrawn`（库中不存在则写墓碑） |
 | 整批采完才提交书目变更和截止日 | 单事务 `BEGIN IMMEDIATE`，全部页取完才写库并提交；异常整体回滚 |
 | 无匹配也推进截止日 | `noRecordsMatch` 不写书目，同事务推进 `last_until` |
+| 撤销 API：传入采集运行编号，只能撤销最近一次成功补采 | `POST /api/v1/runs/{run_id}/revoke`，失败批次不参与判定，不满足条件返回 409 |
+| 改写书目恢复批前内容/状态，新增记录移除 | 每批落库前在 `bib_snapshots` 保存批前整行；撤销时整行写回，本批新增（pre_image 为 NULL）删除 |
+| 续采进度退回批前，撤销首次补采显示未采集 | 同事务恢复 `harvest_progress`；批前无进度则删除进度行，`last_until` 返回 null |
+| 无匹配但推进日期的批次也能撤销 | 无匹配批次同样记录批前进度快照，撤销仅回退截止日 |
+| 撤销在单事务内恢复目录与进度并标记运行，失败则都不改 | 单个 `BEGIN IMMEDIATE` 事务完成恢复/删除/进度回退/`revoked` 标记，异常整体回滚 |
+| 撤销后不可再撤销本批或更早批次 | 已撤销批次再撤销返回 409；更早批次因不是“最近一次成功批次”返回 409 |
+| 采集与撤销全程互斥，重叠拒绝后发请求 | 单进程共用一把 `threading.Lock`，从读取进度到结束持锁，冲突返回 409 |
+| 升级时保留已有目录和进度 | `init_db` 只 `CREATE TABLE IF NOT EXISTS` + `ALTER TABLE ADD COLUMN`，不改动既有数据；旧批次无快照不可撤销 |
 | Docker Compose 启动服务和本地分页样例源 | `docker compose up --build` 启动 `harvester-api` + `oai-source` |
 | Swagger 发起采集并查询目录和进度 | http://localhost:8000/docs |
 
@@ -22,16 +30,16 @@
 
 ```
 app/                  FastAPI 采集服务
-  main.py             路由（采集/目录/进度/运行历史/健康检查）
-  harvester.py        采集编排：翻页、令牌失效重抓、整批事务
+  main.py             路由（采集/撤销/目录/进度/运行历史/健康检查）
+  harvester.py        采集与撤销编排：翻页、重抓、整批事务、进程互斥锁
   oai_client.py       OAI-PMH 2.0 客户端（httpx + xml.etree）
-  db.py               SQLite 表结构与事务操作
+  db.py               SQLite 表结构、增量迁移、快照与恢复事务
   schemas.py          Pydantic 请求/响应模型
   Dockerfile
 sample-oai/           本地分页样例 OAI-PMH 源（纯标准库）
   server.py           27 条样例记录（rec-013 为删除记录），PAGE_SIZE=10，3 页
   Dockerfile
-tests/                pytest 端到端测试（12 个用例）
+tests/                pytest 端到端测试（28 个用例，含撤销场景）
 scripts/              辅助脚本（故障回滚演示）
 docker-compose.yml
 ```
@@ -92,6 +100,49 @@ curl 'http://localhost:8000/api/v1/runs'                    # 采集运行历史
 
 对没有任何记录的区间发起采集，返回 `fetched=0` 且 `last_until` 照常推进。
 
+### 5. 撤销最近一次成功补采
+
+源馆误发书目时，管理员传入采集运行编号撤回**最近一次成功的补采**（之后失败的批次不影响撤销）：
+
+```bash
+# 先在 /api/v1/runs 中查到要撤销的运行编号（第二批 run_id=2）
+curl -X POST http://localhost:8000/api/v1/runs/2/revoke
+```
+
+响应：
+
+```json
+{
+  "run_id": 2,
+  "status": "revoked",
+  "restored": 1,
+  "deleted": 5,
+  "prev_last_until": "2026-10-15",
+  "revoked_at": "2026-11-12T00:05:54Z"
+}
+```
+
+撤销在**同一个 SQLite 事务**内完成：
+
+- `restored`：本批改写过的书目整行恢复到批前的内容与状态（含 active↔withdrawn）；
+- `deleted`：本批新增的记录（含 withdrawn 墓碑）直接移除；
+- 续采进度回退到批前；撤销**首次**补采后进度行被删除，`GET /progress` 返回
+  `{"last_until": null, "last_harvest_at": null}`，即显示未采集；
+- 无匹配但推进了日期的批次同样可撤销，此时 `restored=0、deleted=0`，只回退截止日；
+- 运行历史中该批次标记为 `revoked`。任一步失败整体回滚，目录、进度、历史都不改。
+
+撤销的限制（均返回 `409`，运行不存在返回 `404`）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 撤销的不是最近一次成功批次 | 409，提示最近可撤销批次编号 |
+| 该批次已撤销，再次撤销 | 409 |
+| 撤销升级前的旧批次（无快照） | 409 |
+| 采集/撤销正在进行时又发采集或撤销 | 409，后发请求被拒（单进程互斥） |
+
+撤销之后源馆修正书目，可重新发起补采；新批次成为新的最近成功批次，仍可撤销。
+
+
 ## 令牌失效重抓的验证方法
 
 样例源提供故障注入端点：
@@ -115,9 +166,14 @@ curl -X POST http://localhost:8080/admin/reset   # 清除故障开关
 ## 事务与一致性说明
 
 - 采集过程先在内存中收集全部页面，**不向 SQLite 写任何数据**；
-- 全部页成功后，在单个 `BEGIN IMMEDIATE` 事务内完成 upsert、撤下、截止日推进、运行历史更新；
-- 事务中任何一步失败都会 rollback，库状态回到采集前；
-- 进程内互斥锁保证同一时刻只有一个采集任务，并发请求返回 `409`。
+- 全部页成功后，在单个 `BEGIN IMMEDIATE` 事务内完成批前快照、upsert、撤下、
+  截止日推进、运行历史更新；事务中任何一步失败都会 rollback，库状态回到采集前；
+- 撤销同样在单个 `BEGIN IMMEDIATE` 事务内完成书目恢复/删除、进度回退、
+  运行标记 `revoked`、快照清理，任一步失败整体回滚；
+- 进程内一把互斥锁同时保护采集与撤销（单进程部署）：补采从读取进度到结束
+  全程持锁，与撤销互斥，重叠请求后发者返回 `409`；
+- 升级旧库时只做 `CREATE TABLE IF NOT EXISTS` 与 `ALTER TABLE ADD COLUMN`，
+  已有目录与进度原样保留；升级前写入的批次 `snapshot_version` 为空，不可撤销。
 
 ## 本地开发（无 Docker）
 

@@ -20,12 +20,21 @@ from .oai_client import OAIClient, OAIError, OAIRecord
 
 logger = logging.getLogger("harvester")
 
-# 进程内互斥：同一时刻只允许一个采集任务，避免进度竞争
-_HARVEST_LOCK = threading.Lock()
+# 进程内互斥：同一时刻只允许一个采集或撤销任务（单进程部署），
+# 补采从读取进度到结束与撤销全程互斥，重叠时拒绝后发请求
+_OPERATION_LOCK = threading.Lock()
 
 
 class HarvestConflictError(RuntimeError):
     pass
+
+
+class RevokeNotFoundError(RuntimeError):
+    """撤销目标运行不存在（映射 404）。"""
+
+
+class RevokeError(RuntimeError):
+    """撤销条件不满足（映射 409）。"""
 
 
 @dataclass
@@ -41,6 +50,15 @@ class HarvestSummary:
     run_id: int
     status: str = "success"
     note: str | None = None
+
+
+@dataclass
+class RevokeSummary:
+    run_id: int
+    restored: int
+    deleted: int
+    prev_last_until: str | None
+    revoked_at: str
 
 
 def _fetch_full_window(client: OAIClient, from_date: str | None,
@@ -105,13 +123,13 @@ def _fetch_full_window(client: OAIClient, from_date: str | None,
 def harvest(client: OAIClient, *, until_date: str,
             from_date: str | None) -> HarvestSummary:
     """执行一次采集。from_date 为 None 时从上次成功截止日续采。"""
-    if not _HARVEST_LOCK.acquire(blocking=False):
-        raise HarvestConflictError("已有采集任务正在执行，请稍后再试")
+    if not _OPERATION_LOCK.acquire(blocking=False):
+        raise HarvestConflictError("已有采集或撤销任务正在执行，请稍后再试")
     try:
         return _harvest_locked(client, until_date=until_date,
                                from_date=from_date)
     finally:
-        _HARVEST_LOCK.release()
+        _OPERATION_LOCK.release()
 
 
 def _harvest_locked(client: OAIClient, *, until_date: str,
@@ -138,22 +156,39 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
 
         # 整批落库：单事务，任何异常整体回滚，半批数据不会入库
         with db.transaction(conn):
+            # 批前进度在同一事务、同一把互斥锁下读取，保证撤销可准确回退
+            prev_last_until, prev_harvest_at = db.get_progress_snapshot(conn)
             inserted = updated = withdrawn = 0
             for record in records:
                 if record.deleted:
                     # 遇删除标记就撤下；库中不存在则落 withdrawn 墓碑
-                    if db.withdraw_bib_record(
-                        conn, identifier=record.identifier,
-                        datestamp=record.datestamp,
-                    ):
-                        withdrawn += 1
+                    existed = db.snapshot_bib_record(
+                        conn, run_id=run_id, identifier=record.identifier
+                    )
+                    if existed:
+                        db.withdraw_bib_record(
+                            conn, identifier=record.identifier,
+                            datestamp=record.datestamp,
+                        )
                     else:
+                        # 本批新增的墓碑：登记触碰标识，撤销时直接删除
+                        db.insert_run_touched(
+                            conn, run_id=run_id, identifier=record.identifier
+                        )
                         db.insert_withdrawn_tombstone(
                             conn, identifier=record.identifier,
                             datestamp=record.datestamp,
                         )
-                        withdrawn += 1
+                    withdrawn += 1
                     continue
+                existed = db.snapshot_bib_record(
+                    conn, run_id=run_id, identifier=record.identifier
+                )
+                if not existed:
+                    # 本批新增：登记触碰标识（pre_image 为 NULL），撤销时删除
+                    db.insert_run_touched(
+                        conn, run_id=run_id, identifier=record.identifier
+                    )
                 outcome = db.upsert_bib_record(
                     conn,
                     identifier=record.identifier,
@@ -171,6 +206,9 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
                 conn, run_id, status="success", pages=pages,
                 fetched=len(records), inserted=inserted, updated=updated,
                 withdrawn=withdrawn, retries=retries, error=None,
+                snapshot_version=db.SNAPSHOT_VERSION,
+                prev_last_until=prev_last_until,
+                prev_harvest_at=prev_harvest_at,
             )
             conn.commit()
 
@@ -216,10 +254,14 @@ def _harvest_locked(client: OAIClient, *, until_date: str,
 def _commit_empty_window(conn, run_id: int, from_date: str | None,
                          until_date: str) -> HarvestSummary:
     with db.transaction(conn):
+        prev_last_until, prev_harvest_at = db.get_progress_snapshot(conn)
         db.advance_progress(conn, until_date)
         db.finish_run(
             conn, run_id, status="success", pages=0, fetched=0,
             inserted=0, updated=0, withdrawn=0, retries=0, error=None,
+            snapshot_version=db.SNAPSHOT_VERSION,
+            prev_last_until=prev_last_until,
+            prev_harvest_at=prev_harvest_at,
         )
         conn.commit()
     logger.info("区间 %s~%s 无匹配记录，截止日仍推进至 %s",
@@ -236,6 +278,76 @@ def _commit_empty_window(conn, run_id: int, from_date: str | None,
         run_id=run_id,
         note="区间内无匹配记录，截止日已推进",
     )
+
+
+def revoke_run(run_id: int) -> RevokeSummary:
+    """撤销一次成功补采。
+
+    只允许撤销升级后最近一次成功的补采；之后的失败批次不影响判定。
+    与采集共用进程锁，重叠时拒绝后发请求。目录恢复、进度回退、运行标记
+    在同一个 SQLite 事务内完成，任一步失败整体回滚。
+    """
+    if not _OPERATION_LOCK.acquire(blocking=False):
+        raise HarvestConflictError("已有采集或撤销任务正在执行，请稍后再试")
+    try:
+        return _revoke_locked(run_id)
+    finally:
+        _OPERATION_LOCK.release()
+
+
+def _revoke_locked(run_id: int) -> RevokeSummary:
+    conn = db.get_connection()
+    try:
+        with db.transaction(conn):
+            run = db.get_run(conn, run_id)
+            if run is None:
+                # 不存在属于客户端寻址错误：回滚只读事务并转 404
+                conn.rollback()
+                raise RevokeNotFoundError(f"采集运行 {run_id} 不存在")
+
+            if run["snapshot_version"] is None:
+                raise RevokeError(
+                    f"运行 {run_id} 是升级前的旧批次，缺少撤销快照，无法撤销"
+                )
+            if run["status"] == "revoked":
+                raise RevokeError(f"运行 {run_id} 已撤销，不能重复撤销")
+            if run["status"] != "success":
+                raise RevokeError(
+                    f"运行 {run_id} 状态为 {run['status']}，只有成功的补采可撤销"
+                )
+
+            latest = db.get_latest_terminal_run(conn)
+            if latest is None or latest["id"] != run_id:
+                latest_id = latest["id"] if latest is not None else "无"
+                raise RevokeError(
+                    f"运行 {run_id} 不是最近一次成功的补采"
+                    f"（最近可撤销批次为 {latest_id}），无法撤销"
+                )
+
+            restored = db.restore_bib_snapshot(conn, run_id)
+            deleted = db.delete_unsnapshotted_touched(conn, run_id)
+            db.restore_progress(
+                conn, run["prev_last_until"], run["prev_harvest_at"]
+            )
+            revoked_at = db.utc_now_iso()
+            db.mark_run_revoked(conn, run_id, revoked_at=revoked_at)
+            db.delete_snapshots(conn, run_id)
+            conn.commit()
+
+        logger.info(
+            "撤销成功 run=%d 恢复改写=%d 删除新增=%d 进度回退至 %s",
+            run_id, restored, deleted,
+            run["prev_last_until"] or "未采集",
+        )
+        return RevokeSummary(
+            run_id=run_id,
+            restored=restored,
+            deleted=deleted,
+            prev_last_until=run["prev_last_until"],
+            revoked_at=revoked_at,
+        )
+    finally:
+        conn.close()
 
 
 def _first_values(dc: dict) -> dict:

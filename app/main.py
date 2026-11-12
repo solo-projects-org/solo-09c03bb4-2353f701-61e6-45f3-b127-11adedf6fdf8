@@ -8,13 +8,20 @@ from datetime import date
 from fastapi import FastAPI, HTTPException, Query
 
 from . import db
-from .harvester import HarvestConflictError, harvest
+from .harvester import (
+    HarvestConflictError,
+    RevokeError,
+    RevokeNotFoundError,
+    harvest,
+    revoke_run,
+)
 from .oai_client import OAIClient, OAIError
 from .schemas import (
     BibRecordOut,
     HarvestRequest,
     HarvestResponse,
     ProgressResponse,
+    RevokeResponse,
     RunOut,
 )
 
@@ -35,9 +42,11 @@ app = FastAPI(
         "通过 OAI-PMH ListRecords(oai_dc) 按日期补采单馆书目。\n\n"
         "- 首次采集另填起始日；之后从上次成功采集的截止日（含当天）续采\n"
         "- 续页只用 resumptionToken；令牌失效则丢弃已取页、按原区间重抓一次\n"
-        "- 整批采完才在一个事务内提交书目变更和截止日，无匹配也推进截止日"
+        "- 整批采完才在一个事务内提交书目变更和截止日，无匹配也推进截止日\n"
+        "- 撤销 API 只能撤销升级后最近一次成功的补采，单事务恢复目录与进度，\n"
+        "  之后失败的批次不影响撤销；撤销后不可再撤销本批或更早批次"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -92,6 +101,30 @@ def trigger_harvest(req: HarvestRequest) -> HarvestResponse:
             ) from exc
 
     return HarvestResponse(**summary.__dict__)
+
+
+@app.post(
+    "/api/v1/runs/{run_id}/revoke",
+    response_model=RevokeResponse,
+    summary="撤销一次成功补采（仅允许最近一次成功批次）",
+    tags=["采集"],
+)
+def trigger_revoke(run_id: int) -> RevokeResponse:
+    try:
+        summary = revoke_run(run_id)
+    except RevokeNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RevokeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HarvestConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        # 撤销事务已整体回滚：目录、进度、运行历史均保持撤销前状态
+        raise HTTPException(
+            status_code=500,
+            detail=f"撤销失败，全部变更已回滚：{exc}",
+        ) from exc
+    return RevokeResponse(**summary.__dict__)
 
 
 @app.get(
